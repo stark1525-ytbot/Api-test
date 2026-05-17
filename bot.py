@@ -3,60 +3,111 @@ from fastapi import FastAPI, Query
 from pymongo import MongoClient
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uvicorn
+import os
 
 app = FastAPI()
 
-# Load your 150 URLs from the CSV
-# Make sure this file exists in your project root
-try:
-    df = pd.read_csv('master_cluster_list.csv')
-    CLUSTER_URLS = df['url'].tolist() 
-except Exception as e:
-    print(f"Error loading CSV: {e}")
-    CLUSTER_URLS = []
+# --- CONFIGURATION ---
+CSV_FILE = 'master_cluster_list.csv'
+COLUMN_NAME = 'Python Connection String'
+
+def load_all_clusters():
+    """Reads all 150 URLs from your CSV file"""
+    try:
+        df = pd.read_csv(CSV_FILE)
+        df.columns = df.columns.str.strip() # Remove hidden spaces in headers
+        if COLUMN_NAME in df.columns:
+            urls = df[COLUMN_NAME].dropna().tolist()
+            print(f"✅ Loaded {len(urls)} clusters.")
+            return urls
+        else:
+            print(f"❌ Error: Could not find column '{COLUMN_NAME}'")
+            return []
+    except Exception as e:
+        print(f"❌ Error loading CSV: {e}")
+        return []
+
+CLUSTER_URLS = load_all_clusters()
 
 def search_single_cluster(url, search_query):
-    """Function to search a single MongoDB cluster"""
+    """Searches one cluster automatically finding DBs and Collections"""
+    client = None
     try:
-        # Set a short timeout (3-5 seconds) so one dead cluster doesn't hang the whole API
+        # 3-second timeout so offline clusters don't slow us down
         client = MongoClient(url, serverSelectionTimeoutMS=3000)
         
-        # IMPORTANT: Change these to your actual Database and Collection names
-        db = client['your_database_name'] 
-        collection = db['your_collection_name']
+        # 1. Get all databases (ignoring system ones)
+        all_dbs = client.list_database_names()
+        user_dbs = [d for d in all_dbs if d not in ['admin', 'local', 'config']]
         
-        # Note: This requires a Text Index in MongoDB to work.
-        # If you don't have one, use: collection.find({"field_name": {"$regex": search_query}})
-        results = list(collection.find({"$text": {"$search": search_query}}).limit(5))
-        
-        # Clean up IDs for JSON serialization
-        for res in results:
-            res['_id'] = str(res['_id'])
-            res['source_cluster'] = url[:25] + "..." # Identify source cluster safely
-            
-        client.close()
-        return results
-    except Exception:
-        return [] # Return empty if cluster is down or login fails
+        cluster_results = []
 
-# FIX: Changed @get to @app.get
+        for db_name in user_dbs:
+            db = client[db_name]
+            # 2. Get all collections in this database
+            collections = db.list_collection_names()
+            
+            for coll_name in collections:
+                collection = db[coll_name]
+                
+                # 3. Search logic for the 'phone' field
+                # Checks for exact string, exact integer, and partial match
+                conditions = [{"phone": search_query}]
+                
+                try:
+                    # If query is a number, search for integer version too
+                    conditions.append({"phone": int(search_query)})
+                except: pass
+                
+                # Search for partial matches (regex)
+                conditions.append({"phone": {"$regex": str(search_query), "$options": "i"}})
+
+                results = list(collection.find({"$or": conditions}).limit(5))
+                
+                for res in results:
+                    res['_id'] = str(res['_id']) # Convert ObjectId to string
+                    res['found_in_db'] = db_name
+                    res['found_in_coll'] = coll_name
+                    res['source_cluster'] = url.split('@')[-1].split('/')[0]
+                    cluster_results.append(res)
+
+        return cluster_results
+    except Exception:
+        return [] # Ignore errors for dead clusters
+    finally:
+        if client: client.close()
+
 @app.get("/search")
-def search_all(q: str = Query(..., min_length=3)):
+def search_api(q: str = Query(..., min_length=3)):
+    """
+    Search endpoint: /search?q=7678685516
+    """
+    if not CLUSTER_URLS:
+        return {"error": "CSV file not found or empty."}
+
     all_results = []
     
-    # Use ThreadPoolExecutor to search all clusters at the same time
-    # max_workers=50 allows 50 clusters to be queried simultaneously 
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        # Create a list of tasks
+    # max_workers=150 ensures we hit every cluster at once
+    with ThreadPoolExecutor(max_workers=len(CLUSTER_URLS)) as executor:
         futures = [executor.submit(search_single_cluster, url, q) for url in CLUSTER_URLS]
         
         for future in as_completed(futures):
-            result = future.result()
-            if result:
-                all_results.extend(result)
+            res = future.result()
+            if res:
+                all_results.extend(res)
                 
-    return {"query": q, "total_found": len(all_results), "results": all_results}
+    return {
+        "search_term": q,
+        "clusters_searched": len(CLUSTER_URLS),
+        "total_results": len(all_results),
+        "results": all_results
+    }
 
-# FIX: Changed name to __name__
+@app.get("/")
+def home():
+    return {"status": "Bot is Online", "total_clusters": len(CLUSTER_URLS)}
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Get port for Render deployment
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
