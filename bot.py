@@ -9,7 +9,7 @@ app = FastAPI()
 # Load your 150 URLs from the CSV
 df = pd.read_csv('master_cluster_list.csv')
 # Assuming your CSV has a column named 'url'
-CLUSTER_URLS = df['url'].tolist() 
+CLUSTER_URLS = df['Python Connection String'].tolist() 
 
 def search_single_cluster(url, search_query):
     """Function to search a single MongoDB cluster"""
