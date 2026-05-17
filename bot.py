@@ -11,103 +11,101 @@ app = FastAPI()
 CSV_FILE = 'master_cluster_list.csv'
 COLUMN_NAME = 'Python Connection String'
 
-def load_all_clusters():
-    """Reads all 150 URLs from your CSV file"""
+# We will store the actual database objects here
+# This stays in memory so search is instant
+ACTIVE_COLLECTIONS = []
+
+def initialize_single_cluster(url):
+    """Connects to a cluster and finds the data collection once"""
+    try:
+        # We use a long-lived client
+        client = MongoClient(url, 
+                             serverSelectionTimeoutMS=5000, 
+                             maxPoolSize=10, 
+                             minPoolSize=1)
+        
+        dbs = client.list_database_names()
+        user_dbs = [d for d in dbs if d not in ['admin', 'local', 'config']]
+        if not user_dbs: return None
+        
+        db = client[user_dbs[0]]
+        colls = db.list_collection_names()
+        if not colls: return None
+        
+        # Return the collection object directly
+        return {
+            "collection": db[colls[0]],
+            "name": url.split('@')[-1].split('.')[0]
+        }
+    except:
+        return None
+
+@app.on_event("startup")
+def startup_event():
+    """Warms up connections. Render friendly: lower concurrency during boot."""
+    global ACTIVE_COLLECTIONS
+    print("🚀 Connecting to clusters...")
     try:
         df = pd.read_csv(CSV_FILE)
-        df.columns = df.columns.str.strip() # Remove hidden spaces in headers
-        if COLUMN_NAME in df.columns:
-            urls = df[COLUMN_NAME].dropna().tolist()
-            print(f"✅ Loaded {len(urls)} clusters.")
-            return urls
-        else:
-            print(f"❌ Error: Could not find column '{COLUMN_NAME}'")
-            return []
+        df.columns = df.columns.str.strip()
+        urls = df[COLUMN_NAME].dropna().tolist()
+        
+        # Use only 20 workers during startup to prevent Render 'port' error
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(initialize_single_cluster, url) for url in urls]
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    ACTIVE_COLLECTIONS.append(res)
+                    
+        print(f"✅ Successfully connected to {len(ACTIVE_COLLECTIONS)} clusters.")
     except Exception as e:
-        print(f"❌ Error loading CSV: {e}")
-        return []
+        print(f"❌ Startup Error: {e}")
 
-CLUSTER_URLS = load_all_clusters()
-
-def search_single_cluster(url, search_query):
-    """Searches one cluster automatically finding DBs and Collections"""
-    client = None
+def search_worker(cluster_data, q):
+    """Searches using an already open connection"""
     try:
-        # 3-second timeout so offline clusters don't slow us down
-        client = MongoClient(url, serverSelectionTimeoutMS=3000)
+        coll = cluster_data['collection']
         
-        # 1. Get all databases (ignoring system ones)
-        all_dbs = client.list_database_names()
-        user_dbs = [d for d in all_dbs if d not in ['admin', 'local', 'config']]
-        
-        cluster_results = []
-
-        for db_name in user_dbs:
-            db = client[db_name]
-            # 2. Get all collections in this database
-            collections = db.list_collection_names()
+        # Search for exact string or exact integer (FASTEST with index)
+        query_val = q
+        if q.isdigit():
+            query_val = int(q)
             
-            for coll_name in collections:
-                collection = db[coll_name]
-                
-                # 3. Search logic for the 'phone' field
-                # Checks for exact string, exact integer, and partial match
-                conditions = [{"phone": search_query}]
-                
-                try:
-                    # If query is a number, search for integer version too
-                    conditions.append({"phone": int(search_query)})
-                except: pass
-                
-                # Search for partial matches (regex)
-                conditions.append({"phone": {"$regex": str(search_query), "$options": "i"}})
-
-                results = list(collection.find({"$or": conditions}).limit(5))
-                
-                for res in results:
-                    res['_id'] = str(res['_id']) # Convert ObjectId to string
-                    res['found_in_db'] = db_name
-                    res['found_in_coll'] = coll_name
-                    res['source_cluster'] = url.split('@')[-1].split('/')[0]
-                    cluster_results.append(res)
-
-        return cluster_results
-    except Exception:
-        return [] # Ignore errors for dead clusters
-    finally:
-        if client: client.close()
+        # Standard query (No Regex for speed)
+        results = list(coll.find({"phone": query_val}).limit(5))
+        
+        processed = []
+        for r in results:
+            r['_id'] = str(r['_id'])
+            r['cluster'] = cluster_data['name']
+            processed.append(r)
+        return processed
+    except:
+        return []
 
 @app.get("/search")
 def search_api(q: str = Query(..., min_length=3)):
-    """
-    Search endpoint: /search?q=7678685516
-    """
-    if not CLUSTER_URLS:
-        return {"error": "CSV file not found or empty."}
+    """The actual search is now extremely fast because connections are already open"""
+    if not ACTIVE_COLLECTIONS:
+        return {"error": "Clusters not connected yet."}
 
     all_results = []
     
-    # max_workers=150 ensures we hit every cluster at once
-    with ThreadPoolExecutor(max_workers=len(CLUSTER_URLS)) as executor:
-        futures = [executor.submit(search_single_cluster, url, q) for url in CLUSTER_URLS]
-        
+    # max_workers=50 is the "sweet spot" for Render to prevent crashes
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = [executor.submit(search_worker, cluster, q) for cluster in ACTIVE_COLLECTIONS]
         for future in as_completed(futures):
             res = future.result()
             if res:
                 all_results.extend(res)
                 
-    return {
-        "search_term": q,
-        "clusters_searched": len(CLUSTER_URLS),
-        "total_results": len(all_results),
-        "results": all_results
-    }
+    return {"total": len(all_results), "results": all_results}
 
 @app.get("/")
-def home():
-    return {"status": "Bot is Online", "total_clusters": len(CLUSTER_URLS)}
+def health():
+    return {"status": "online", "clusters": len(ACTIVE_COLLECTIONS)}
 
 if __name__ == "__main__":
-    # Get port for Render deployment
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
