@@ -1,11 +1,10 @@
+import os
 import pandas as pd
 from fastapi import FastAPI, Query
 from pymongo import MongoClient
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
 import uvicorn
-import os
-
-app = FastAPI()
 
 # ---------------- CONFIG ----------------
 CSV_FILE = "master_cluster_list.csv"
@@ -13,8 +12,7 @@ COLUMN_NAME = "Python Connection String"
 
 ACTIVE_COLLECTIONS = []
 
-
-# ---------------- CONNECT SINGLE CLUSTER ----------------
+# ---------------- CLUSTER INIT ----------------
 def init_cluster(url):
     try:
         client = MongoClient(
@@ -45,19 +43,18 @@ def init_cluster(url):
         return None
 
 
-# ---------------- STARTUP ----------------
-@app.on_event("startup")
-def startup():
+# ---------------- LIFESPAN (NEW FASTAPI WAY) ----------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global ACTIVE_COLLECTIONS
 
-    print("🚀 Loading clusters...")
+    print("🚀 Starting cluster load...")
 
     df = pd.read_csv(CSV_FILE)
     df.columns = df.columns.str.strip()
 
     urls = df[COLUMN_NAME].dropna().tolist()
 
-    # IMPORTANT: limit concurrency to avoid Render crash
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = [executor.submit(init_cluster, url) for url in urls]
 
@@ -66,10 +63,18 @@ def startup():
             if res:
                 ACTIVE_COLLECTIONS.append(res)
 
-    print(f"✅ Connected clusters: {len(ACTIVE_COLLECTIONS)}")
+    print(f"✅ Loaded clusters: {len(ACTIVE_COLLECTIONS)}")
+
+    yield
+
+    print("🛑 Shutting down...")
 
 
-# ---------------- SEARCH WORKER ----------------
+# ---------------- APP ----------------
+app = FastAPI(lifespan=lifespan)
+
+
+# ---------------- SEARCH ----------------
 def search_cluster(cluster, q):
     try:
         coll = cluster["collection"]
@@ -95,15 +100,13 @@ def search_cluster(cluster, q):
         return []
 
 
-# ---------------- API ----------------
 @app.get("/search")
 def search(q: str = Query(..., min_length=3)):
     if not ACTIVE_COLLECTIONS:
-        return {"error": "No clusters loaded"}
+        return {"error": "Clusters not loaded yet"}
 
     all_results = []
 
-    # LIMIT threads for Render stability
     with ThreadPoolExecutor(max_workers=30) as executor:
         futures = [
             executor.submit(search_cluster, c, q)
@@ -121,16 +124,21 @@ def search(q: str = Query(..., min_length=3)):
     }
 
 
-# ---------------- HEALTH ----------------
 @app.get("/")
-def home():
+def health():
     return {
         "status": "running",
-        "clusters_loaded": len(ACTIVE_COLLECTIONS)
+        "clusters": len(ACTIVE_COLLECTIONS)
     }
 
 
-# ---------------- RUN ----------------
+# ---------------- RUN (IMPORTANT FOR RENDER) ----------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
