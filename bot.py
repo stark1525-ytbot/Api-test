@@ -1,8 +1,9 @@
-import os
 import pandas as pd
 from fastapi import FastAPI, Query
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uvicorn
+import os
 
 app = FastAPI()
 
@@ -10,91 +11,122 @@ app = FastAPI()
 CSV_FILE = "master_cluster_list.csv"
 COLUMN_NAME = "Python Connection String"
 
-MONGO_URI = os.environ.get("MONGO_URI")  # set in Render env
-DB_NAME = "central_db"
-COLLECTION_NAME = "clients"
-
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-collection = db[COLLECTION_NAME]
+ACTIVE_COLLECTIONS = []
 
 
-# ---------------- INDEX SETUP ----------------
-def create_indexes():
-    collection.create_index([("phone_number", ASCENDING)])
-    collection.create_index([("client_id", ASCENDING)])
-    print("✅ Indexes created")
+# ---------------- CONNECT SINGLE CLUSTER ----------------
+def init_cluster(url):
+    try:
+        client = MongoClient(
+            url,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            maxPoolSize=5
+        )
+
+        dbs = client.list_database_names()
+        dbs = [d for d in dbs if d not in ["admin", "local", "config"]]
+
+        if not dbs:
+            return None
+
+        db = client[dbs[0]]
+        cols = db.list_collection_names()
+
+        if not cols:
+            return None
+
+        return {
+            "collection": db[cols[0]],
+            "name": url.split('@')[-1].split('.')[0]
+        }
+
+    except:
+        return None
 
 
-# ---------------- LOAD CSV TO MONGO ----------------
-def load_csv_to_mongo():
-    if collection.estimated_document_count() > 0:
-        print("⚡ Data already exists, skipping load")
-        return
+# ---------------- STARTUP ----------------
+@app.on_event("startup")
+def startup():
+    global ACTIVE_COLLECTIONS
+
+    print("🚀 Loading clusters...")
 
     df = pd.read_csv(CSV_FILE)
     df.columns = df.columns.str.strip()
 
-    records = []
+    urls = df[COLUMN_NAME].dropna().tolist()
 
-    for _, row in df.iterrows():
-        records.append({
-            "client_id": str(row.get("client_id", "")).strip(),
-            "phone_number": str(row.get("phone_number", "")).strip(),
-            "cluster_name": str(row.get(COLUMN_NAME, "")).strip(),
-            "raw_data": row.to_dict()
-        })
+    # IMPORTANT: limit concurrency to avoid Render crash
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(init_cluster, url) for url in urls]
 
-    if records:
-        collection.insert_many(records)
-        print(f"✅ Inserted {len(records)} records")
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                ACTIVE_COLLECTIONS.append(res)
 
-
-# ---------------- STARTUP EVENT ----------------
-@app.on_event("startup")
-def startup():
-    print("🚀 Starting API...")
-    create_indexes()
-    load_csv_to_mongo()
-    print("✅ Ready on Render")
+    print(f"✅ Connected clusters: {len(ACTIVE_COLLECTIONS)}")
 
 
-# ---------------- SEARCH API ----------------
+# ---------------- SEARCH WORKER ----------------
+def search_cluster(cluster, q):
+    try:
+        coll = cluster["collection"]
+
+        query_val = int(q) if q.isdigit() else q
+
+        results = list(coll.find(
+            {
+                "$or": [
+                    {"phone_number": query_val},
+                    {"client_id": query_val}
+                ]
+            },
+            {"_id": 0}
+        ).limit(5))
+
+        for r in results:
+            r["cluster"] = cluster["name"]
+
+        return results
+
+    except:
+        return []
+
+
+# ---------------- API ----------------
 @app.get("/search")
-def search(
-    q: str = Query(..., min_length=3),
-    mode: str = "auto"  # auto | phone | id
-):
-    query = {}
+def search(q: str = Query(..., min_length=3)):
+    if not ACTIVE_COLLECTIONS:
+        return {"error": "No clusters loaded"}
 
-    if mode == "phone" or q.isdigit():
-        query = {"phone_number": q}
+    all_results = []
 
-    elif mode == "id":
-        query = {"client_id": q}
+    # LIMIT threads for Render stability
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        futures = [
+            executor.submit(search_cluster, c, q)
+            for c in ACTIVE_COLLECTIONS
+        ]
 
-    else:
-        query = {
-            "$or": [
-                {"phone_number": q},
-                {"client_id": q}
-            ]
-        }
-
-    results = list(collection.find(query, {"_id": 0}).limit(50))
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                all_results.extend(res)
 
     return {
-        "total": len(results),
-        "results": results
+        "total": len(all_results),
+        "results": all_results
     }
 
 
-# ---------------- HEALTH CHECK ----------------
+# ---------------- HEALTH ----------------
 @app.get("/")
-def health():
+def home():
     return {
-        "status": "online",
-        "records": collection.estimated_document_count()
+        "status": "running",
+        "clusters_loaded": len(ACTIVE_COLLECTIONS)
     }
 
 
